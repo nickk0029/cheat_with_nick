@@ -1,0 +1,8 @@
+google-genai
+faster-whisper
+sounddevice
+numpy
+python-dotenv
+mss
+pillow
+pynput
