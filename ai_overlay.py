@@ -1,9 +1,24 @@
+"""
+AI Overlay Assistant - Day 4: Mic or System audio -> Whisper -> Gemini -> screen.
+
+Install:
+    py -m pip install google-genai faster-whisper sounddevice soundcard numpy python-dotenv mss pillow pynput
+.env file:
+    GEMINI_API_KEY=your_key_here
+Run:
+    py ai_overlay.py
+
+Voice button: click to start listening to the chosen source (Mic or System), click again to stop and answer.
+"""
 import io
 import os
 import queue
 import threading
 import tkinter as tk
+import warnings
 from tkinter import ttk
+
+warnings.filterwarnings("ignore")   # hides harmless soundcard "data discontinuity" warnings
 
 try:
     from dotenv import load_dotenv
@@ -15,6 +30,12 @@ import numpy as np
 import sounddevice as sd
 from google import genai
 from google.genai import types
+
+try:
+    import soundcard as sc
+    HAS_LOOPBACK = True
+except Exception:
+    HAS_LOOPBACK = False
 
 try:
     import mss
@@ -34,7 +55,8 @@ MODEL = "gemini-3.5-flash-lite"
 MAX_TOKENS = 800
 MAX_TURNS = 8
 WHISPER_MODEL = "base"
-SAMPLE_RATE = 16000
+WHISPER_RATE = 16000
+LOOPBACK_RATE = 48000          # system audio is recorded at 48k, then reduced to 16k for Whisper
 SYSTEM_PROMPT = (
     "You are an ultra-fast, precise assistant displayed in a compact overlay window. "
     "Provide direct, highly concise answers. For multiple-choice questions, state the correct "
@@ -47,8 +69,10 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=API_KEY) if API_KEY else None
 
 history = []
-frames = []
-stream = None
+mic_frames = []
+sys_frames = []
+mic_stream = None
+sys_thread = None
 recording = False
 busy = False
 stt = None
@@ -70,7 +94,7 @@ def pump():
     root.after(40, pump)
 
 
-# ---------------- UI Helpers ----------------
+# ---------------- UI helpers ----------------
 def append(text, tag=None):
     out.config(state="normal")
     out.insert("end", text, tag)
@@ -91,17 +115,13 @@ def clear_chat():
 
 
 def copy_last_response():
-    try:
-        # Find the last model response from history
-        last_model_msg = next((h["text"] for h in reversed(history) if h["role"] == "model"), "")
-        if last_model_msg:
-            root.clipboard_clear()
-            root.clipboard_append(last_model_msg)
-            set_status("Copied to clipboard!")
-        else:
-            set_status("Nothing to copy")
-    except Exception:
-        set_status("Copy failed")
+    last = next((h["text"] for h in reversed(history) if h["role"] == "model"), "")
+    if last:
+        root.clipboard_clear()
+        root.clipboard_append(last)
+        set_status("Copied to clipboard!")
+    else:
+        set_status("Nothing to copy")
 
 
 def toggle_window():
@@ -113,7 +133,7 @@ def toggle_window():
         root.withdraw()
 
 
-# ---------------- Gemini Inference ----------------
+# ---------------- Gemini ----------------
 def ask_ai(display_text, new_parts, history_text):
     global busy
     if busy:
@@ -122,7 +142,7 @@ def ask_ai(display_text, new_parts, history_text):
     if client is None:
         ui(append, "\n[Error] GEMINI_API_KEY missing. Check your .env file.\n", "err")
         return
-    
+
     busy = True
     ui(set_status, "Thinking...")
     ui(append, f"\nYou: {display_text}\n\n", "you")
@@ -158,7 +178,6 @@ def ask_ai(display_text, new_parts, history_text):
         ui(set_status, "Error")
     finally:
         busy = False
-        ui(lambda: entry.focus())
 
 
 def send_typed(_event=None):
@@ -170,31 +189,72 @@ def send_typed(_event=None):
     threading.Thread(target=ask_ai, args=(text, parts, text), daemon=True).start()
 
 
-# ---------------- Voice Recording ----------------
-def audio_cb(indata, frame_count, time_info, status_flags):
-    frames.append(indata.copy())
+# ---------------- Audio capture ----------------
+def mic_cb(indata, frame_count, time_info, status_flags):
+    mic_frames.append(indata.copy().flatten())
+
+
+def system_record_loop():
+    """Runs in a background thread: records what the speakers are playing."""
+    # Windows needs COM started in every thread that touches audio (fixes error 0x800401f0)
+    try:
+        import ctypes
+        ctypes.windll.ole32.CoInitializeEx(None, 0)
+        com_started = True
+    except Exception:
+        com_started = False
+    try:
+        speaker = sc.default_speaker()
+        loop = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+        with loop.recorder(samplerate=LOOPBACK_RATE) as rec:
+            while recording:
+                data = rec.record(numframes=LOOPBACK_RATE // 10)   # 0.1 second chunks
+                sys_frames.append(data.mean(axis=1).astype(np.float32))
+    except Exception as e:
+        ui(append, f"\n[System audio error] {e}\n", "err")
+    finally:
+        if com_started:
+            ctypes.windll.ole32.CoUninitialize()
 
 
 def toggle_record():
-    global stream, recording
+    global mic_stream, sys_thread, recording
+    source = source_var.get()
+
     if not recording:
-        try:
-            frames.clear()
-            stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=audio_cb)
-            stream.start()
-        except Exception as e:
-            append(f"\n[Mic Error] {e}\n", "err")
-            return
-        recording = True
+        mic_frames.clear()
+        sys_frames.clear()
+        if source == "System":
+            if not HAS_LOOPBACK:
+                append("\n[Error] Run: py -m pip install soundcard\n", "err")
+                return
+            recording = True
+            sys_thread = threading.Thread(target=system_record_loop, daemon=True)
+            sys_thread.start()
+            set_status("Listening to system audio...")
+        else:
+            try:
+                mic_stream = sd.InputStream(samplerate=WHISPER_RATE, channels=1,
+                                            dtype="float32", callback=mic_cb)
+                mic_stream.start()
+            except Exception as e:
+                append(f"\n[Mic Error] {e}\n", "err")
+                return
+            recording = True
+            set_status("Listening to mic...")
         rec_btn.config(text="Stop", bg="#ef4444")
-        set_status("Listening...")
     else:
-        stream.stop()
-        stream.close()
         recording = False
+        if mic_stream is not None:
+            mic_stream.stop()
+            mic_stream.close()
+            mic_stream = None
+        if sys_thread is not None:
+            sys_thread.join(timeout=2)
+            sys_thread = None
         rec_btn.config(text="Voice", bg="#27272a")
         set_status("Transcribing...")
-        threading.Thread(target=transcribe_and_ask, daemon=True).start()
+        threading.Thread(target=transcribe_and_ask, args=(source,), daemon=True).start()
 
 
 def get_stt():
@@ -207,12 +267,16 @@ def get_stt():
     return stt
 
 
-def transcribe_and_ask():
+def transcribe_and_ask(source):
+    frames = sys_frames if source == "System" else mic_frames
     if not frames:
         ui(set_status, "No audio captured")
         return
     try:
-        audio = np.concatenate(frames).flatten()
+        audio = np.concatenate(frames).astype(np.float32)
+        if source == "System":
+            usable = len(audio) // 3 * 3                 # 48000 Hz -> 16000 Hz
+            audio = audio[:usable].reshape(-1, 3).mean(axis=1)
         segments, _ = get_stt().transcribe(audio, vad_filter=True)
         text = " ".join(s.text for s in segments).strip()
     except Exception as e:
@@ -221,10 +285,11 @@ def transcribe_and_ask():
     if not text:
         ui(set_status, "Heard nothing")
         return
-    ask_ai(text, [types.Part.from_text(text=text)], text)
+    label = f"[{source}] {text}"
+    ask_ai(label, [types.Part.from_text(text=text)], text)
 
 
-# ---------------- Screenshot Capture ----------------
+# ---------------- Screenshot ----------------
 def screenshot_ask():
     if not HAS_SHOT:
         append("\n[Error] Install mss and pillow first.\n", "err")
@@ -259,7 +324,7 @@ def _do_shot():
     threading.Thread(target=ask_ai, args=(label, parts, label), daemon=True).start()
 
 
-# ---------------- Global Hotkeys ----------------
+# ---------------- Hotkeys ----------------
 def start_hotkeys():
     if not HAS_HOTKEYS:
         return
@@ -274,7 +339,7 @@ def start_hotkeys():
         pass
 
 
-# ---------------- Main Window UI Setup ----------------
+# ---------------- Window ----------------
 root = tk.Tk()
 root.title("AI Overlay Assistant")
 root.geometry("460x580+40+40")
@@ -282,58 +347,56 @@ root.attributes("-topmost", True)
 root.attributes("-alpha", 0.94)
 root.configure(bg="#09090b")
 
-# Top Control Bar
 top = tk.Frame(root, bg="#09090b")
 top.pack(fill="x", padx=10, pady=(10, 4))
-
 status = tk.Label(top, text="Ready", bg="#09090b", fg="#71717a", font=("Segoe UI", 9))
 status.pack(side="left")
-
-tk.Button(top, text="Clear", command=clear_chat, bg="#18181b", fg="#a1a1aa", relief="flat", font=("Segoe UI", 9), padx=8, pady=2, cursor="hand2").pack(side="right", padx=(4, 0))
-tk.Button(top, text="Copy", command=copy_last_response, bg="#18181b", fg="#a1a1aa", relief="flat", font=("Segoe UI", 9), padx=8, pady=2, cursor="hand2").pack(side="right", padx=(4, 0))
-
+tk.Button(top, text="Clear", command=clear_chat, bg="#18181b", fg="#a1a1aa", relief="flat",
+          font=("Segoe UI", 9), padx=8, pady=2, cursor="hand2").pack(side="right", padx=(4, 0))
+tk.Button(top, text="Copy", command=copy_last_response, bg="#18181b", fg="#a1a1aa", relief="flat",
+          font=("Segoe UI", 9), padx=8, pady=2, cursor="hand2").pack(side="right", padx=(4, 0))
 alpha_slider = ttk.Scale(top, from_=0.4, to=1.0, value=0.94, length=60,
                          command=lambda v: root.attributes("-alpha", float(v)))
 alpha_slider.pack(side="right", padx=6)
 
-# Main Output Text Area with Scrollbar
 text_frame = tk.Frame(root, bg="#09090b")
 text_frame.pack(fill="both", expand=True, padx=10, pady=4)
-
-scrollbar = tk.Scrollbar(text_frame, bg="#18181b", troughcolor="#09090b", activebackground="#27272a", width=8)
+scrollbar = tk.Scrollbar(text_frame, width=8)
 scrollbar.pack(side="right", fill="y")
-
 out = tk.Text(text_frame, wrap="word", bg="#09090b", fg="#f4f4f5", font=("Segoe UI", 10),
               relief="flat", state="disabled", padx=8, pady=8, spacing3=4,
               yscrollcommand=scrollbar.set)
 out.pack(side="left", fill="both", expand=True)
 scrollbar.config(command=out.yview)
+out.tag_config("you", foreground="#60a5fa")
+out.tag_config("ai_label", foreground="#4ade80")
+out.tag_config("ai", foreground="#f4f4f5")
+out.tag_config("err", foreground="#f87171")
 
-# Tag Styling
-out.tag_config("you", foreground="#60a5fa")     # Blue
-out.tag_config("ai_label", foreground="#4ade80") # Green label
-out.tag_config("ai", foreground="#f4f4f5")       # White text
-out.tag_config("err", foreground="#f87171")      # Soft red
-
-# Bottom Input & Action Bar
 bottom = tk.Frame(root, bg="#09090b")
 bottom.pack(fill="x", padx=10, pady=10)
-
-entry = tk.Entry(bottom, bg="#18181b", fg="#f4f4f5", insertbackground="#fff", relief="flat", font=("Segoe UI", 10))
+entry = tk.Entry(bottom, bg="#18181b", fg="#f4f4f5", insertbackground="#fff", relief="flat",
+                 font=("Segoe UI", 10))
 entry.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 6))
 entry.bind("<Return>", send_typed)
 
-tk.Button(bottom, text="Screen", command=screenshot_ask, bg="#27272a", fg="#f4f4f5", relief="flat", font=("Segoe UI", 9, "bold"), padx=10, pady=6, cursor="hand2").pack(side="right", padx=(4, 0))
-rec_btn = tk.Button(bottom, text="Voice", command=toggle_record, bg="#27272a", fg="#f4f4f5", relief="flat", font=("Segoe UI", 9, "bold"), padx=10, pady=6, cursor="hand2")
+tk.Button(bottom, text="Screen", command=screenshot_ask, bg="#27272a", fg="#f4f4f5", relief="flat",
+          font=("Segoe UI", 9, "bold"), padx=10, pady=6, cursor="hand2").pack(side="right", padx=(4, 0))
+rec_btn = tk.Button(bottom, text="Voice", command=toggle_record, bg="#27272a", fg="#f4f4f5",
+                    relief="flat", font=("Segoe UI", 9, "bold"), padx=10, pady=6, cursor="hand2")
 rec_btn.pack(side="right", padx=(4, 0))
+source_var = tk.StringVar(value="Mic")
+ttk.Combobox(bottom, textvariable=source_var, values=["Mic", "System"], width=7,
+             state="readonly").pack(side="right", padx=(4, 0))
 
-# Startup Checks
 if client is None:
     append("[Error] GEMINI_API_KEY not found. Create a .env file with your key.\n", "err")
+if not HAS_LOOPBACK:
+    append("[Note] System audio disabled. Run: py -m pip install soundcard\n", "err")
 if not HAS_SHOT:
-    append("[Note] Screenshots disabled. Run: pip install mss pillow\n", "err")
+    append("[Note] Screenshots disabled. Run: py -m pip install mss pillow\n", "err")
 if not HAS_HOTKEYS:
-    append("[Note] Hotkeys disabled. Run: pip install pynput\n", "err")
+    append("[Note] Hotkeys disabled. Run: py -m pip install pynput\n", "err")
 
 start_hotkeys()
 pump()
