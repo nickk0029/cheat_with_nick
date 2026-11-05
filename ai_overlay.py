@@ -1,5 +1,7 @@
 """
-AI Overlay Assistant - Day 4: Mic or System audio -> Whisper -> Gemini -> screen.
+AI Overlay Assistant - Day 6: Auto mode.
+Press "Auto" and the app listens continuously (Mic or System audio),
+detects when someone finishes talking, transcribes it, and answers if it is a question.
 
 Install:
     py -m pip install google-genai faster-whisper sounddevice soundcard numpy python-dotenv mss pillow pynput
@@ -8,17 +10,25 @@ Install:
 Run:
     py ai_overlay.py
 
-Voice button: click to start listening to the chosen source (Mic or System), click again to stop and answer.
+Buttons:
+    Auto     start/stop continuous listening (uses the Mic/System dropdown)
+    Voice    old manual mode: click to start, click again to stop and answer
+    Screen   read the screen
+Hotkeys:
+    Ctrl+Shift+H show/hide   Ctrl+Shift+S screenshot   Ctrl+Shift+A auto on/off
 """
 import io
 import os
 import queue
+import re
 import threading
+import time
 import tkinter as tk
 import warnings
+from collections import deque
 from tkinter import ttk
 
-warnings.filterwarnings("ignore")   # hides harmless soundcard "data discontinuity" warnings
+warnings.filterwarnings("ignore")
 
 try:
     from dotenv import load_dotenv
@@ -30,6 +40,7 @@ import numpy as np
 import sounddevice as sd
 from google import genai
 from google.genai import types
+from faster_whisper.vad import VadOptions, get_speech_timestamps
 
 try:
     import soundcard as sc
@@ -55,8 +66,14 @@ MODEL = "gemini-3.5-flash-lite"
 MAX_TOKENS = 800
 MAX_TURNS = 8
 WHISPER_MODEL = "base"
-WHISPER_RATE = 16000
-LOOPBACK_RATE = 48000          # system audio is recorded at 48k, then reduced to 16k for Whisper
+RATE = 16000
+LOOPBACK_RATE = 48000
+BLOCK = 4096                   # samples per VAD check = 0.256 s
+SILENCE_END = 0.7              # seconds of silence = utterance finished
+MIN_UTTERANCE = 0.8            # ignore sounds shorter than this (seconds)
+MAX_UTTERANCE = 15.0           # force-cut very long speech (seconds)
+MIN_SPEECH_BLOCKS = 3          # need at least 3 speech blocks (~0.75 s) or it is treated as noise
+LANGUAGE = "en"                # fixed language is much faster than auto-detect; use "hi" for Hindi, None = auto
 SYSTEM_PROMPT = (
     "You are an ultra-fast, precise assistant displayed in a compact overlay window. "
     "Provide direct, highly concise answers. For multiple-choice questions, state the correct "
@@ -64,20 +81,37 @@ SYSTEM_PROMPT = (
     "provide clean code snippets and a brief one-line note. Plain text only, no markdown symbols."
 )
 
+WAKE_RE = re.compile(r"^\W*(hey|hi|hello|ok|okay)\W+(assist\w*|a\s*sistant)\W*", re.IGNORECASE)
+WHISPER_HINT = "Hey assistant. Questions about Python, coding, maths and general knowledge."
+JUNK = {"thank you", "thanks", "thanks for watching", "you", "bye", "okay", "ok", "yeah", "hmm", "um", "uh"}
+
+vad_opts = VadOptions(threshold=0.5, min_speech_duration_ms=100,
+                      min_silence_duration_ms=100, speech_pad_ms=0)
+
+QUESTION_STARTS = tuple(w + " " for w in [
+    "what", "why", "how", "when", "where", "who", "which", "whose", "explain", "define",
+    "describe", "write", "solve", "find", "calculate", "compare", "list", "tell me",
+    "can you", "could you", "is", "are", "do", "does", "did", "will", "would", "should",
+    "give me",
+])
+
 # ---------------- State ----------------
 API_KEY = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=API_KEY) if API_KEY else None
 
 history = []
+recent = deque(maxlen=8)       # last things heard (rolling context)
 mic_frames = []
 sys_frames = []
 mic_stream = None
 sys_thread = None
-recording = False
+recording = False              # manual Voice mode
+auto_on = False                # Auto mode
 busy = False
 stt = None
 stt_lock = threading.Lock()
 ui_q = queue.Queue()
+utt_q = queue.Queue()          # finished utterances waiting to be transcribed
 
 
 def ui(fn, *args):
@@ -108,6 +142,7 @@ def set_status(text):
 
 def clear_chat():
     history.clear()
+    recent.clear()
     out.config(state="normal")
     out.delete("1.0", "end")
     out.config(state="disabled")
@@ -131,6 +166,24 @@ def toggle_window():
         entry.focus()
     else:
         root.withdraw()
+
+
+def start_com():
+    """Windows needs COM started in every thread that records audio."""
+    try:
+        import ctypes
+        ctypes.windll.ole32.CoInitializeEx(None, 0)
+        return True
+    except Exception:
+        return False
+
+
+def stop_com():
+    try:
+        import ctypes
+        ctypes.windll.ole32.CoUninitialize()
+    except Exception:
+        pass
 
 
 # ---------------- Gemini ----------------
@@ -169,7 +222,7 @@ def ask_ai(display_text, new_parts, history_text):
         history.append({"role": "user", "text": history_text})
         history.append({"role": "model", "text": reply})
         ui(append, "\n", None)
-        ui(set_status, "Ready")
+        ui(set_status, "Listening (auto)..." if auto_on else "Ready")
     except Exception as e:
         msg = str(e)
         if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
@@ -189,36 +242,205 @@ def send_typed(_event=None):
     threading.Thread(target=ask_ai, args=(text, parts, text), daemon=True).start()
 
 
-# ---------------- Audio capture ----------------
+# ---------------- Speech to text ----------------
+def get_stt():
+    global stt
+    with stt_lock:
+        if stt is None:
+            from faster_whisper import WhisperModel
+            ui(set_status, "Loading Whisper model...")
+            stt = WhisperModel(WHISPER_MODEL, compute_type="int8", cpu_threads=min(8, os.cpu_count() or 4))
+    return stt
+
+
+def transcribe(audio, trim_silence=False):
+    """Returns (text, seconds it took)."""
+    t0 = time.time()
+    segments, _ = get_stt().transcribe(
+        audio.astype(np.float32),
+        language=LANGUAGE,
+        beam_size=1,                          # fastest decoding
+        vad_filter=trim_silence,              # auto mode already cut the audio with VAD
+        condition_on_previous_text=False,
+        initial_prompt=WHISPER_HINT,          # helps it recognise "hey assistant" and tech words
+    )
+    # drop segments Whisper itself is unsure about (usually noise it imagined as words)
+    good = [s.text for s in segments if s.no_speech_prob < 0.6 and s.avg_logprob > -1.2]
+    text = " ".join(good).strip()
+    if re.sub(r"[^a-z ]", "", text.lower()).strip() in JUNK:
+        text = ""
+    return text, time.time() - t0
+
+
+def is_question(text):
+    t = text.strip().lower()
+    if len(t.split()) < 3:
+        return False
+    return t.endswith("?") or t.startswith(QUESTION_STARTS)
+
+
+# ---------------- Auto mode ----------------
+def has_speech(block):
+    return len(get_speech_timestamps(block, vad_opts)) > 0
+
+
+def mic_blocks():
+    q = queue.Queue()
+
+    def cb(indata, frames, t, status_flags):
+        q.put(indata.copy().flatten())
+
+    with sd.InputStream(samplerate=RATE, channels=1, dtype="float32",
+                        blocksize=BLOCK, callback=cb):
+        while auto_on:
+            try:
+                yield q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+
+def system_blocks():
+    speaker = sc.default_speaker()
+    loop = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+    with loop.recorder(samplerate=LOOPBACK_RATE) as rec:
+        while auto_on:
+            data = rec.record(numframes=BLOCK * 3)
+            mono = data.mean(axis=1).astype(np.float32)
+            yield mono[: BLOCK * 3].reshape(-1, 3).mean(axis=1)    # 48k -> 16k
+
+
+def listen_loop(source):
+    """Background thread: cut the audio stream into utterances using VAD."""
+    com = start_com()
+    gen = None
+    try:
+        gen = system_blocks() if source == "System" else mic_blocks()
+        speaking = False
+        silent_for = 0.0
+        speech_blocks = 0
+        buf = []
+        pre = None
+        for block in gen:
+            if not auto_on:
+                break
+            level = float(np.sqrt(np.mean(block ** 2)))          # how loud this block is
+            if has_speech(block):
+                if not speaking:
+                    speaking = True
+                    speech_blocks = 0
+                    buf = [pre] if pre is not None else []
+                speech_blocks += 1
+                silent_for = 0.0
+                buf.append(block)
+                ui(set_status, f"Hearing speech...  level {level:.3f}")
+            elif speaking:
+                buf.append(block)
+                silent_for += BLOCK / RATE
+                if silent_for >= SILENCE_END:
+                    speaking = False
+                    if speech_blocks >= MIN_SPEECH_BLOCKS:
+                        flush(buf)
+                    buf = []
+            else:
+                ui(set_status, f"Listening (auto)...  level {level:.3f}")
+            if speaking and len(buf) * BLOCK / RATE > MAX_UTTERANCE:
+                flush(buf)
+                buf = []
+                speaking = False
+            pre = block
+    except Exception as e:
+        ui(append, f"\n[Auto mode error] {e}\n", "err")
+    finally:
+        if gen is not None:
+            gen.close()
+        if com:
+            stop_com()
+        ui(set_status, "Auto off")
+
+
+def flush(buf):
+    audio = np.concatenate(buf)
+    if len(audio) / RATE >= MIN_UTTERANCE:
+        utt_q.put(audio)
+
+
+def utterance_worker():
+    """Background thread: transcribe each finished utterance, answer if it is a question."""
+    while True:
+        audio = utt_q.get()
+        ui(set_status, "Transcribing...")
+        try:
+            text, secs = transcribe(audio)
+        except Exception as e:
+            ui(append, f"\n[STT Error] {e}\n", "err")
+            continue
+        if not text:
+            ui(set_status, "Listening (auto)...")
+            continue
+        ui(append, f"\n(speech to text: {secs:.1f}s for {len(audio) / RATE:.1f}s of audio)", "heard")
+        wake = WAKE_RE.match(text)
+        if wake:
+            text = text[wake.end():].strip()
+            if not text:
+                ui(append, "\nAssistant: I'm listening, ask your question.\n", "heard")
+                ui(set_status, "Listening (auto)...")
+                continue
+        if wake or is_question(text):
+            context = "\n".join(list(recent)[-4:])
+            prompt = f"Recent conversation:\n{context}\n\nLatest question: {text}" if context else text
+            recent.append(text)
+            ask_ai(f"[Auto] {text}", [types.Part.from_text(text=prompt)], text)
+        else:
+            recent.append(text)
+            ui(append, f"\nHeard: {text}\n", "heard")
+
+
+def toggle_auto():
+    global auto_on
+    if not auto_on:
+        if recording:
+            set_status("Stop Voice first")
+            return
+        source = source_var.get()
+        if source == "System" and not HAS_LOOPBACK:
+            append("\n[Error] Run: py -m pip install soundcard\n", "err")
+            return
+        auto_on = True
+        auto_btn.config(text="Auto: ON", bg="#16a34a")
+        threading.Thread(target=get_stt, daemon=True).start()       # preload Whisper
+        threading.Thread(target=listen_loop, args=(source,), daemon=True).start()
+    else:
+        auto_on = False
+        auto_btn.config(text="Auto: OFF", bg="#27272a")
+        set_status("Stopping auto...")
+
+
+# ---------------- Manual voice (click start, click stop) ----------------
 def mic_cb(indata, frame_count, time_info, status_flags):
     mic_frames.append(indata.copy().flatten())
 
 
 def system_record_loop():
-    """Runs in a background thread: records what the speakers are playing."""
-    # Windows needs COM started in every thread that touches audio (fixes error 0x800401f0)
-    try:
-        import ctypes
-        ctypes.windll.ole32.CoInitializeEx(None, 0)
-        com_started = True
-    except Exception:
-        com_started = False
+    com = start_com()
     try:
         speaker = sc.default_speaker()
         loop = sc.get_microphone(id=str(speaker.name), include_loopback=True)
         with loop.recorder(samplerate=LOOPBACK_RATE) as rec:
             while recording:
-                data = rec.record(numframes=LOOPBACK_RATE // 10)   # 0.1 second chunks
+                data = rec.record(numframes=LOOPBACK_RATE // 10)
                 sys_frames.append(data.mean(axis=1).astype(np.float32))
     except Exception as e:
         ui(append, f"\n[System audio error] {e}\n", "err")
     finally:
-        if com_started:
-            ctypes.windll.ole32.CoUninitialize()
+        if com:
+            stop_com()
 
 
 def toggle_record():
     global mic_stream, sys_thread, recording
+    if auto_on:
+        set_status("Turn Auto off first")
+        return
     source = source_var.get()
 
     if not recording:
@@ -234,7 +456,7 @@ def toggle_record():
             set_status("Listening to system audio...")
         else:
             try:
-                mic_stream = sd.InputStream(samplerate=WHISPER_RATE, channels=1,
+                mic_stream = sd.InputStream(samplerate=RATE, channels=1,
                                             dtype="float32", callback=mic_cb)
                 mic_stream.start()
             except Exception as e:
@@ -254,20 +476,10 @@ def toggle_record():
             sys_thread = None
         rec_btn.config(text="Voice", bg="#27272a")
         set_status("Transcribing...")
-        threading.Thread(target=transcribe_and_ask, args=(source,), daemon=True).start()
+        threading.Thread(target=manual_transcribe_and_ask, args=(source,), daemon=True).start()
 
 
-def get_stt():
-    global stt
-    with stt_lock:
-        if stt is None:
-            from faster_whisper import WhisperModel
-            ui(set_status, "Loading Whisper model...")
-            stt = WhisperModel(WHISPER_MODEL, compute_type="int8")
-    return stt
-
-
-def transcribe_and_ask(source):
+def manual_transcribe_and_ask(source):
     frames = sys_frames if source == "System" else mic_frames
     if not frames:
         ui(set_status, "No audio captured")
@@ -275,18 +487,16 @@ def transcribe_and_ask(source):
     try:
         audio = np.concatenate(frames).astype(np.float32)
         if source == "System":
-            usable = len(audio) // 3 * 3                 # 48000 Hz -> 16000 Hz
+            usable = len(audio) // 3 * 3
             audio = audio[:usable].reshape(-1, 3).mean(axis=1)
-        segments, _ = get_stt().transcribe(audio, vad_filter=True)
-        text = " ".join(s.text for s in segments).strip()
+        text, _ = transcribe(audio, trim_silence=True)
     except Exception as e:
         ui(append, f"\n[STT Error] {e}\n", "err")
         return
     if not text:
         ui(set_status, "Heard nothing")
         return
-    label = f"[{source}] {text}"
-    ask_ai(label, [types.Part.from_text(text=text)], text)
+    ask_ai(f"[{source}] {text}", [types.Part.from_text(text=text)], text)
 
 
 # ---------------- Screenshot ----------------
@@ -332,6 +542,7 @@ def start_hotkeys():
         hk = pk.GlobalHotKeys({
             "<ctrl>+<shift>+h": lambda: ui(toggle_window),
             "<ctrl>+<shift>+s": lambda: ui(screenshot_ask),
+            "<ctrl>+<shift>+a": lambda: ui(toggle_auto),
         })
         hk.daemon = True
         hk.start()
@@ -371,6 +582,7 @@ scrollbar.config(command=out.yview)
 out.tag_config("you", foreground="#60a5fa")
 out.tag_config("ai_label", foreground="#4ade80")
 out.tag_config("ai", foreground="#f4f4f5")
+out.tag_config("heard", foreground="#71717a")
 out.tag_config("err", foreground="#f87171")
 
 bottom = tk.Frame(root, bg="#09090b")
@@ -381,10 +593,13 @@ entry.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 6))
 entry.bind("<Return>", send_typed)
 
 tk.Button(bottom, text="Screen", command=screenshot_ask, bg="#27272a", fg="#f4f4f5", relief="flat",
-          font=("Segoe UI", 9, "bold"), padx=10, pady=6, cursor="hand2").pack(side="right", padx=(4, 0))
+          font=("Segoe UI", 9, "bold"), padx=8, pady=6, cursor="hand2").pack(side="right", padx=(4, 0))
 rec_btn = tk.Button(bottom, text="Voice", command=toggle_record, bg="#27272a", fg="#f4f4f5",
-                    relief="flat", font=("Segoe UI", 9, "bold"), padx=10, pady=6, cursor="hand2")
+                    relief="flat", font=("Segoe UI", 9, "bold"), padx=8, pady=6, cursor="hand2")
 rec_btn.pack(side="right", padx=(4, 0))
+auto_btn = tk.Button(bottom, text="Auto: OFF", command=toggle_auto, bg="#27272a", fg="#f4f4f5",
+                     relief="flat", font=("Segoe UI", 9, "bold"), padx=8, pady=6, cursor="hand2")
+auto_btn.pack(side="right", padx=(4, 0))
 source_var = tk.StringVar(value="Mic")
 ttk.Combobox(bottom, textvariable=source_var, values=["Mic", "System"], width=7,
              state="readonly").pack(side="right", padx=(4, 0))
@@ -398,6 +613,7 @@ if not HAS_SHOT:
 if not HAS_HOTKEYS:
     append("[Note] Hotkeys disabled. Run: py -m pip install pynput\n", "err")
 
+threading.Thread(target=utterance_worker, daemon=True).start()
 start_hotkeys()
 pump()
 entry.focus()
